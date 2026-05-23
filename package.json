@@ -11,7 +11,7 @@
     "setup:indexes": "node scripts/setupIndexes.js",
     "setup:urban": "node scripts/setupUrbanIncidentTables.js",
     "seed:urban": "node scripts/seedUrbanIncidentPosts.js",
-    "test": "jest",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "lint": "eslint src/"
   },
   "dependencies": {

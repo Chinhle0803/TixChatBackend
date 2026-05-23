@@ -10,14 +10,16 @@ import CallRepository from '../repositories/CallRepository.js'
 import ConversationRepository from '../repositories/ConversationRepository.js'
 import MessageRepository from '../repositories/MessageRepository.js'
 import ParticipantRepository from '../repositories/ParticipantRepository.js'
-import { messageEvents } from '../events/EventBus.js'
-import { MESSAGE_EVENTS } from '../events/EventTypes.js'
+import { conversationEvents, messageEvents } from '../events/EventBus.js'
+import { CONVERSATION_EVENTS, MESSAGE_EVENTS } from '../events/EventTypes.js'
 import { getIO } from '../utils/ioInstance.js'
 
 const TERMINAL_STATUSES = ['declined', 'ended', 'missed']
+const ACTIVE_STATUSES = ['ringing', 'accepted']
 const RINGING_EVENT_INTERVAL_MS = 5000
+const GROUP_CALL_ACTIVE_NOTICE_KIND = 'group_call_active'
 
-class CallService {
+export class CallService {
   constructor() {
     this.chimeClient = new ChimeSDKMeetingsClient({
       region: config.awsChimeRegion,
@@ -28,6 +30,25 @@ class CallService {
     })
     this.missedCallTimers = new Map()
     this.ringingEventTimers = new Map()
+    this.boundConversationEvents = false
+    this.bindConversationEvents()
+  }
+
+  bindConversationEvents() {
+    if (this.boundConversationEvents) return
+    this.boundConversationEvents = true
+
+    conversationEvents.on(CONVERSATION_EVENTS.PARTICIPANT_ADDED, (payload) => {
+      this.handleConversationParticipantAdded(payload).catch((error) => {
+        console.warn('Failed to sync participant added with active call:', error?.message || error)
+      })
+    })
+
+    conversationEvents.on(CONVERSATION_EVENTS.PARTICIPANT_REMOVED, (payload) => {
+      this.handleConversationParticipantRemoved(payload).catch((error) => {
+        console.warn('Failed to sync participant removed with active call:', error?.message || error)
+      })
+    })
   }
 
   normalizeId(value) {
@@ -36,25 +57,117 @@ class CallService {
     return String(value)
   }
 
-  toPublicCall(call) {
+  uniqueIds(values = []) {
+    return [...new Set((values || []).map((id) => this.normalizeId(id)).filter(Boolean))]
+  }
+
+  removeIds(values = [], idsToRemove = []) {
+    const removeSet = new Set(this.uniqueIds(idsToRemove))
+    return this.uniqueIds(values).filter((id) => !removeSet.has(id))
+  }
+
+  isGroupCall(call) {
+    const conversationType = String(call?.conversationType || '').toLowerCase()
+    if (conversationType === 'group') return true
+    return this.getCallParticipantIds(call).length > 2
+  }
+
+  getCallParticipantIds(call) {
+    const participantIds = Array.isArray(call?.participantIds) ? call.participantIds : []
+    const fallbackIds = [call?.callerId, call?.calleeId]
+    return this.uniqueIds([...participantIds, ...fallbackIds])
+  }
+
+  getJoinedCallParticipantIds(call) {
+    const joinedByIds = this.uniqueIds(call?.joinedByIds || [])
+    if (joinedByIds.length > 0) return joinedByIds
+
+    if (call?.status === 'accepted') {
+      return this.getRemainingCallParticipantIds(call)
+    }
+
+    const callerId = this.normalizeId(call?.callerId)
+    return callerId ? [callerId] : []
+  }
+
+  getInactiveParticipantIds(call) {
+    return this.uniqueIds([
+      ...(Array.isArray(call?.leftByIds) ? call.leftByIds : []),
+      ...(Array.isArray(call?.declinedByIds) ? call.declinedByIds : []),
+    ])
+  }
+
+  getRemainingCallParticipantIds(call) {
+    const inactiveIds = new Set(this.getInactiveParticipantIds(call))
+    return this.getCallParticipantIds(call).filter((userId) => !inactiveIds.has(userId))
+  }
+
+  getActiveJoinedParticipantIds(call) {
+    const inactiveIds = new Set(this.getInactiveParticipantIds(call))
+    return this.getJoinedCallParticipantIds(call).filter((userId) => !inactiveIds.has(userId))
+  }
+
+  isParticipantInactive(call, userId) {
+    const normalizedUserId = this.normalizeId(userId)
+    return normalizedUserId ? this.getInactiveParticipantIds(call).includes(normalizedUserId) : false
+  }
+
+  getViewerCallState(call, userId) {
+    const normalizedUserId = this.normalizeId(userId)
+    if (!call || !normalizedUserId) return ''
+
+    const status = String(call?.status || '').toLowerCase()
+    if (TERMINAL_STATUSES.includes(status)) return status
+
+    const participantIds = this.getCallParticipantIds(call)
+    const isCallParticipant = participantIds.includes(normalizedUserId)
+    if (!isCallParticipant) return 'unavailable'
+
+    if (status === 'ringing') {
+      if (this.normalizeId(call.callerId) === normalizedUserId) return 'ringing'
+      return this.isParticipantInactive(call, normalizedUserId) ? 'declined' : 'incoming'
+    }
+
+    if (status === 'accepted') {
+      if (this.getActiveJoinedParticipantIds(call).includes(normalizedUserId)) {
+        return 'joined'
+      }
+
+      if (this.isGroupCall(call)) {
+        return 'available'
+      }
+    }
+
+    return status || 'unknown'
+  }
+
+  toPublicCall(call, viewerUserId = null) {
     if (!call) return null
     const { meeting, attendees, ...publicCall } = call
-    return publicCall
+    const normalizedCall = {
+      ...publicCall,
+      participantIds: this.getCallParticipantIds(publicCall),
+      joinedByIds: this.getJoinedCallParticipantIds(publicCall),
+      leftByIds: this.uniqueIds(publicCall.leftByIds || []),
+      declinedByIds: this.uniqueIds(publicCall.declinedByIds || []),
+      activeParticipantIds: this.getActiveJoinedParticipantIds(publicCall),
+    }
+
+    if (viewerUserId) {
+      normalizedCall.viewerCallState = this.getViewerCallState(publicCall, viewerUserId)
+    }
+
+    return normalizedCall
   }
 
   emitToCallParticipants(eventName, call, payload = {}) {
-    const publicCall = this.toPublicCall(call)
-    if (!publicCall) return
+    if (!call) return
 
     try {
       const io = getIO()
-      const userIds = this.getCallParticipantIds(publicCall)
-        .map((id) => this.normalizeId(id))
-        .filter(Boolean)
-
-      userIds.forEach((userId) => {
+      this.getCallParticipantIds(call).forEach((userId) => {
         io.to(`user:${userId}`).emit(eventName, {
-          call: publicCall,
+          call: this.toPublicCall(call, userId),
           ...payload,
         })
       })
@@ -63,40 +176,44 @@ class CallService {
     }
   }
 
-  getCallParticipantIds(call) {
-    const participantIds = Array.isArray(call?.participantIds) ? call.participantIds : []
-    const fallbackIds = [call?.callerId, call?.calleeId]
-    return [...new Set([...participantIds, ...fallbackIds].map((id) => this.normalizeId(id)).filter(Boolean))]
-  }
-
-  getIncomingCallRecipientIds(call) {
-    const callerId = this.normalizeId(call?.callerId)
-    return this.getCallParticipantIds(call).filter((userId) => userId && userId !== callerId)
-  }
-
-  getRemainingCallParticipantIds(call) {
-    const inactiveIds = new Set([
-      ...(Array.isArray(call?.leftByIds) ? call.leftByIds : []),
-      ...(Array.isArray(call?.declinedByIds) ? call.declinedByIds : []),
-    ].map((id) => this.normalizeId(id)).filter(Boolean))
-
-    return this.getCallParticipantIds(call).filter((userId) => !inactiveIds.has(userId))
-  }
-
   emitToUser(eventName, userId, call, payload = {}) {
-    const publicCall = this.toPublicCall(call)
     const normalizedUserId = this.normalizeId(userId)
-    if (!publicCall || !normalizedUserId) return
+    if (!call || !normalizedUserId) return
 
     try {
       const io = getIO()
       io.to(`user:${normalizedUserId}`).emit(eventName, {
-        call: publicCall,
+        call: this.toPublicCall(call, normalizedUserId),
         ...payload,
       })
     } catch (error) {
       console.warn(`Failed to emit ${eventName}:`, error?.message || error)
     }
+  }
+
+  emitActiveGroupCallAvailable(call, excludeIds = []) {
+    if (!this.isGroupCall(call) || call?.status !== 'accepted') return
+
+    const excluded = new Set(this.uniqueIds(excludeIds))
+    const activeIds = new Set(this.getActiveJoinedParticipantIds(call))
+
+    this.getCallParticipantIds(call).forEach((userId) => {
+      if (excluded.has(userId) || activeIds.has(userId)) return
+      this.emitToUser('call:active_available', userId, call)
+    })
+  }
+
+  async getActiveConversationParticipantIds(conversationId) {
+    const participants = await ParticipantRepository.findByConversationId(conversationId, 1000)
+    return this.uniqueIds((participants || []).filter((participant) => !participant?.leftAt).map((participant) => participant.userId))
+  }
+
+  async ensureCurrentConversationParticipant(conversationId, userId) {
+    const participant = await ParticipantRepository.findOne(conversationId, userId)
+    if (!participant || participant.leftAt) {
+      throw new Error('You are not an active participant of this conversation')
+    }
+    return participant
   }
 
   async ensureCallParticipants(conversationId, actorId) {
@@ -129,10 +246,29 @@ class CallService {
 
     return {
       conversation,
+      conversationType,
       callerId: this.normalizeId(actorId),
       calleeId: this.normalizeId(callee?.userId),
       participantIds: participants.map((participant) => this.normalizeId(participant.userId)).filter(Boolean),
     }
+  }
+
+  async assertCanJoinCall(call, userId) {
+    const normalizedUserId = this.normalizeId(userId)
+    if (!normalizedUserId) {
+      throw new Error('Invalid user')
+    }
+
+    if (this.getCallParticipantIds(call).includes(normalizedUserId)) {
+      return
+    }
+
+    if (this.isGroupCall(call) && call?.conversationId) {
+      await this.ensureCurrentConversationParticipant(call.conversationId, normalizedUserId)
+      return
+    }
+
+    throw new Error('You are not a participant of this call')
   }
 
   assertCallParticipant(call, userId) {
@@ -175,6 +311,13 @@ class CallService {
     return `Cuộc gọi ${callLabel}. Thời gian gọi: ${duration}.`
   }
 
+  buildGroupCallActiveNoticeContent(call, active = true) {
+    const callLabel = call?.callType === 'video' ? 'video' : 'thoại'
+    return active
+      ? `Cuộc gọi nhóm ${callLabel} đang diễn ra. Nhấn để tham gia.`
+      : `Cuộc gọi nhóm ${callLabel} đã kết thúc.`
+  }
+
   async persistCallMessage(call) {
     const publicCall = this.toPublicCall(call)
     const content = this.buildCallMessageContent(publicCall)
@@ -211,6 +354,79 @@ class CallService {
 
     messageEvents.emit(MESSAGE_EVENTS.SENT, {
       conversationId: publicCall.conversationId,
+      message,
+    })
+
+    return message
+  }
+
+  async persistGroupCallActiveNotice(call) {
+    if (!this.isGroupCall(call) || call?.status !== 'accepted' || call?.activeNoticeMessageId) {
+      return call
+    }
+
+    const publicCall = this.toPublicCall(call)
+    const message = await MessageRepository.create({
+      conversationId: publicCall.conversationId,
+      senderId: 'system',
+      content: this.buildGroupCallActiveNoticeContent(publicCall, true),
+      type: 'system',
+      attachments: [],
+      status: 'sent',
+      seenBy: [],
+      deliveredTo: [],
+      metadata: {
+        kind: GROUP_CALL_ACTIVE_NOTICE_KIND,
+        callId: publicCall.callId,
+        callType: publicCall.callType,
+        conversationId: publicCall.conversationId,
+        active: true,
+        startedAt: Number(publicCall.acceptedAt || publicCall.startedAt || Date.now()),
+        endedAt: null,
+      },
+    })
+
+    await ConversationRepository.update(publicCall.conversationId, {
+      updatedAt: Number(message?.createdAt || Date.now()),
+    })
+
+    messageEvents.emit(MESSAGE_EVENTS.SENT, {
+      conversationId: publicCall.conversationId,
+      message,
+    })
+
+    return CallRepository.update(publicCall.callId, {
+      activeNoticeMessageId: message.messageId,
+    })
+  }
+
+  async completeGroupCallActiveNotice(call, endedAt = Date.now()) {
+    if (!this.isGroupCall(call) || !call?.activeNoticeMessageId || !call?.conversationId) return null
+
+    const existing = await MessageRepository.findById(call.conversationId, call.activeNoticeMessageId)
+    if (!existing) return null
+
+    const nextMetadata = {
+      ...(existing.metadata || {}),
+      kind: GROUP_CALL_ACTIVE_NOTICE_KIND,
+      callId: call.callId,
+      callType: call.callType,
+      conversationId: call.conversationId,
+      active: false,
+      startedAt: Number(existing.metadata?.startedAt || call.acceptedAt || call.startedAt || 0),
+      endedAt,
+    }
+
+    const message = await MessageRepository.update(call.conversationId, call.activeNoticeMessageId, {
+      content: this.buildGroupCallActiveNoticeContent(call, false),
+      metadata: nextMetadata,
+      isEdited: false,
+      editedAt: null,
+    })
+
+    messageEvents.emit(MESSAGE_EVENTS.EDITED, {
+      conversationId: call.conversationId,
+      messageId: call.activeNoticeMessageId,
       message,
     })
 
@@ -305,6 +521,11 @@ class CallService {
     this.clearRingingEvents(callId)
   }
 
+  getIncomingCallRecipientIds(call) {
+    const callerId = this.normalizeId(call?.callerId)
+    return this.getCallParticipantIds(call).filter((userId) => userId && userId !== callerId && !this.isParticipantInactive(call, userId))
+  }
+
   async startCall(conversationId, callerId, callType) {
     const normalizedType = String(callType || '').toLowerCase()
     if (!['audio', 'video'].includes(normalizedType)) {
@@ -316,7 +537,8 @@ class CallService {
       throw new Error('There is already an active call in this conversation')
     }
 
-    const { calleeId, participantIds } = await this.ensureCallParticipants(conversationId, callerId)
+    const { calleeId, conversationType, participantIds } = await this.ensureCallParticipants(conversationId, callerId)
+    const normalizedCallerId = this.normalizeId(callerId)
     const callId = uuidv4()
     const meetingResponse = await this.chimeClient.send(new CreateMeetingCommand({
       ClientRequestToken: callId,
@@ -327,7 +549,7 @@ class CallService {
     const meeting = meetingResponse.Meeting
     const attendeeResponse = await this.chimeClient.send(new CreateAttendeeCommand({
       MeetingId: meeting.MeetingId,
-      ExternalUserId: this.normalizeId(callerId).slice(0, 64),
+      ExternalUserId: normalizedCallerId.slice(0, 64),
     }))
 
     const callerAttendee = attendeeResponse.Attendee
@@ -335,15 +557,19 @@ class CallService {
     const call = await CallRepository.create({
       callId,
       conversationId,
-      callerId: this.normalizeId(callerId),
+      conversationType,
+      callerId: normalizedCallerId,
       calleeId,
       participantIds,
+      joinedByIds: [normalizedCallerId],
+      leftByIds: [],
+      declinedByIds: [],
       callType: normalizedType,
       status: 'ringing',
       meetingId: meeting.MeetingId,
       meeting,
       attendees: {
-        [this.normalizeId(callerId)]: callerAttendee,
+        [normalizedCallerId]: callerAttendee,
       },
       startedAt: now,
       createdAt: now,
@@ -351,7 +577,7 @@ class CallService {
     })
 
     this.scheduleMissedTimeout(callId)
-    return { call: this.toPublicCall(call), meeting, attendee: callerAttendee }
+    return { call: this.toPublicCall(call, normalizedCallerId), meeting, attendee: callerAttendee }
   }
 
   async acceptCall(callId, userId) {
@@ -359,44 +585,88 @@ class CallService {
     if (!call) throw new Error('Call not found')
     this.assertCallParticipant(call, userId)
 
-    if (call.status !== 'ringing' && call.status !== 'accepted') {
+    if (call.status === 'accepted') {
+      const result = await this.joinAcceptedCall(call, userId)
+      return { ...result, joinedExisting: true }
+    }
+
+    if (call.status !== 'ringing') {
       throw new Error(`Cannot accept a call with status ${call.status}`)
     }
 
-    const wasAlreadyAccepted = call.status === 'accepted'
     const acceptedAt = call.acceptedAt || Date.now()
-
-    if (!wasAlreadyAccepted) {
-      this.clearCallTimers(callId)
-    }
+    const normalizedUserId = this.normalizeId(userId)
+    const callerId = this.normalizeId(call.callerId)
+    this.clearCallTimers(callId)
 
     let attendee
     let updated
     try {
-      attendee = await this.createAttendeeForUser(call, userId)
+      attendee = await this.createAttendeeForUser(call, normalizedUserId)
       updated = await CallRepository.update(callId, {
         status: 'accepted',
         acceptedAt,
         answeredAt: acceptedAt,
+        joinedByIds: this.uniqueIds([...(call.joinedByIds || []), callerId, normalizedUserId]),
+        leftByIds: this.removeIds(call.leftByIds || [], [normalizedUserId, callerId]),
+        declinedByIds: this.removeIds(call.declinedByIds || [], [normalizedUserId, callerId]),
       })
+      updated = await this.persistGroupCallActiveNotice(updated)
     } catch (error) {
-      if (!wasAlreadyAccepted) {
-        this.scheduleMissedTimeout(callId)
-      }
+      this.scheduleMissedTimeout(callId)
       throw error
     }
 
     this.clearCallTimers(callId)
+    this.emitActiveGroupCallAvailable(updated, [normalizedUserId, callerId])
 
-    return { call: this.toPublicCall(updated), meeting: updated.meeting, attendee }
+    return { call: this.toPublicCall(updated, normalizedUserId), meeting: updated.meeting, attendee }
+  }
+
+  async joinAcceptedCall(call, userId) {
+    if (call.status !== 'accepted') {
+      throw new Error(`Cannot join a call with status ${call.status}`)
+    }
+
+    const normalizedUserId = this.normalizeId(userId)
+    await this.assertCanJoinCall(call, normalizedUserId)
+
+    const participantIds = this.isGroupCall(call)
+      ? this.uniqueIds([...this.getCallParticipantIds(call), ...(await this.getActiveConversationParticipantIds(call.conversationId))])
+      : this.getCallParticipantIds(call)
+    const attendee = await this.createAttendeeForUser(call, normalizedUserId)
+    const updated = await CallRepository.update(call.callId, {
+      participantIds,
+      joinedByIds: this.uniqueIds([...(call.joinedByIds || []), normalizedUserId]),
+      leftByIds: this.removeIds(call.leftByIds || [], [normalizedUserId]),
+      declinedByIds: this.removeIds(call.declinedByIds || [], [normalizedUserId]),
+    })
+
+    return { call: this.toPublicCall(updated, normalizedUserId), meeting: updated.meeting, attendee }
+  }
+
+  async joinCall(callId, userId) {
+    const call = await CallRepository.findById(callId)
+    if (!call) throw new Error('Call not found')
+
+    if (TERMINAL_STATUSES.includes(call.status)) {
+      throw new Error(`Cannot join a call with status ${call.status}`)
+    }
+
+    if (call.status === 'ringing') {
+      const result = await this.acceptCall(callId, userId)
+      return { ...result, acceptedFromRinging: true }
+    }
+
+    const result = await this.joinAcceptedCall(call, userId)
+    return { ...result, joinedExisting: true }
   }
 
   async getOrCreateAttendee(callId, userId) {
     const call = await CallRepository.findById(callId)
     if (!call) throw new Error('Call not found')
-    this.assertCallParticipant(call, userId)
 
-    if (![...TERMINAL_STATUSES, 'ringing', 'accepted'].includes(call.status)) {
+    if (![...TERMINAL_STATUSES, ...ACTIVE_STATUSES].includes(call.status)) {
       throw new Error(`Invalid call status ${call.status}`)
     }
 
@@ -404,15 +674,65 @@ class CallService {
       throw new Error(`Cannot join a call with status ${call.status}`)
     }
 
+    if (call.status === 'accepted') {
+      return this.joinAcceptedCall(call, userId)
+    }
+
+    this.assertCallParticipant(call, userId)
     const attendee = await this.createAttendeeForUser(call, userId)
-    return { call: this.toPublicCall(call), meeting: call.meeting, attendee }
+    return { call: this.toPublicCall(call, userId), meeting: call.meeting, attendee }
   }
 
   async getCall(callId, userId) {
     const call = await CallRepository.findById(callId)
     if (!call) throw new Error('Call not found')
-    this.assertCallParticipant(call, userId)
-    return { call: this.toPublicCall(call) }
+    await this.assertCanJoinCall(call, userId)
+    return { call: this.toPublicCall(call, userId) }
+  }
+
+  async getCurrentCallForUser(userId) {
+    const call = await CallRepository.findLatestActiveByUser(userId)
+    if (!call) {
+      return { call: null }
+    }
+
+    await this.assertCanJoinCall(call, userId)
+
+    if (call.status === 'accepted' && this.isGroupCall(call)) {
+      if (this.getActiveJoinedParticipantIds(call).length <= 1) {
+        return { call: null }
+      }
+      return { call: this.toPublicCall(call, userId) }
+    }
+
+    if (this.isParticipantInactive(call, userId)) {
+      return { call: null }
+    }
+
+    if (call.status === 'ringing') {
+      const callerId = this.normalizeId(call.callerId)
+      const remainingRecipientIds = this.getRemainingCallParticipantIds(call).filter((participantId) => participantId !== callerId)
+      if (remainingRecipientIds.length === 0) {
+        return { call: null }
+      }
+    }
+
+    return { call: this.toPublicCall(call, userId) }
+  }
+
+  async getActiveCallForConversation(conversationId, userId) {
+    await this.ensureCurrentConversationParticipant(conversationId, userId)
+    const call = await CallRepository.findActiveByConversation(conversationId)
+    if (!call) {
+      return { call: null }
+    }
+
+    await this.assertCanJoinCall(call, userId)
+    if (call.status === 'accepted' && this.isGroupCall(call) && this.getActiveJoinedParticipantIds(call).length <= 1) {
+      return { call: null }
+    }
+
+    return { call: this.toPublicCall(call, userId) }
   }
 
   async declineCall(callId, userId) {
@@ -420,26 +740,27 @@ class CallService {
     if (!call) throw new Error('Call not found')
     this.assertCallParticipant(call, userId)
 
-    if (!['ringing', 'accepted'].includes(call.status)) {
-      return { call: this.toPublicCall(call) }
+    if (!ACTIVE_STATUSES.includes(call.status)) {
+      return { call: this.toPublicCall(call, userId) }
+    }
+
+    if (call.status === 'accepted' && this.isGroupCall(call)) {
+      return this.leaveAcceptedGroupCall(call, userId, 'declined')
     }
 
     const participantIds = this.getCallParticipantIds(call)
     const normalizedUserId = this.normalizeId(userId)
-    const isMultiParticipantCall = participantIds.length > 2
+    const isMultiParticipantCall = this.isGroupCall(call)
     const callerId = this.normalizeId(call.callerId)
 
     if (isMultiParticipantCall && normalizedUserId !== callerId) {
-      const declinedByIds = [...new Set([
-        ...(Array.isArray(call.declinedByIds) ? call.declinedByIds : []),
-        normalizedUserId,
-      ].map((id) => this.normalizeId(id)).filter(Boolean))]
+      const declinedByIds = this.uniqueIds([...(call.declinedByIds || []), normalizedUserId])
       const recipientIds = participantIds.filter((participantId) => participantId !== callerId)
       const everyRecipientDeclined = recipientIds.every((participantId) => declinedByIds.includes(participantId))
 
       if (!everyRecipientDeclined) {
         const updated = await CallRepository.update(callId, { declinedByIds })
-        return { call: this.toPublicCall(updated), partial: true }
+        return { call: this.toPublicCall(updated, normalizedUserId), partial: true }
       }
     }
 
@@ -461,11 +782,9 @@ class CallService {
     }
 
     const updated = await CallRepository.update(callId, updates)
-    this.clearCallTimers(callId)
-    await this.persistCallMessage(updated)
-    await this.deleteMeetingQuietly(call.meetingId)
+    await this.finalizeTerminalCall(call, updated)
 
-    return { call: this.toPublicCall(updated) }
+    return { call: this.toPublicCall(updated, normalizedUserId) }
   }
 
   async endCall(callId, userId) {
@@ -474,32 +793,16 @@ class CallService {
     this.assertCallParticipant(call, userId)
 
     if (TERMINAL_STATUSES.includes(call.status)) {
-      return { call: this.toPublicCall(call) }
+      return { call: this.toPublicCall(call, userId) }
     }
 
-    const participantIds = this.getCallParticipantIds(call)
-    const normalizedUserId = this.normalizeId(userId)
-    const isMultiParticipantCall = participantIds.length > 2
-
-    if (isMultiParticipantCall) {
-      const leftByIds = [...new Set([
-        ...(Array.isArray(call.leftByIds) ? call.leftByIds : []),
-        normalizedUserId,
-      ].map((id) => this.normalizeId(id)).filter(Boolean))]
-      const inactiveIds = new Set([
-        ...leftByIds,
-        ...(Array.isArray(call.declinedByIds) ? call.declinedByIds : []),
-      ].map((id) => this.normalizeId(id)).filter(Boolean))
-      const everyoneLeft = participantIds.every((participantId) => inactiveIds.has(participantId))
-
-      if (!everyoneLeft) {
-        const updated = await CallRepository.update(callId, { leftByIds })
-        return { call: this.toPublicCall(updated), partial: true }
-      }
+    if (call.status === 'accepted' && this.isGroupCall(call)) {
+      return this.leaveAcceptedGroupCall(call, userId, 'left')
     }
 
     const wasAccepted = this.hasAcceptedCall(call)
     const terminalAt = Date.now()
+    const normalizedUserId = this.normalizeId(userId)
     const updates = wasAccepted
       ? {
           status: 'ended',
@@ -513,12 +816,125 @@ class CallService {
           missedAt: terminalAt,
           durationSeconds: 0,
         }
-    const updated = await CallRepository.update(callId, updates)
-    this.clearCallTimers(callId)
-    await this.persistCallMessage(updated)
-    await this.deleteMeetingQuietly(call.meetingId)
 
-    return { call: this.toPublicCall(updated) }
+    const updated = await CallRepository.update(callId, updates)
+    await this.finalizeTerminalCall(call, updated)
+
+    return { call: this.toPublicCall(updated, normalizedUserId) }
+  }
+
+  async leaveAcceptedGroupCall(call, userId, reason = 'left') {
+    const normalizedUserId = this.normalizeId(userId)
+    const leftByIds = this.uniqueIds([...(call.leftByIds || []), normalizedUserId])
+    const declinedByIds = reason === 'declined'
+      ? this.uniqueIds([...(call.declinedByIds || []), normalizedUserId])
+      : this.uniqueIds(call.declinedByIds || [])
+    const nextCall = {
+      ...call,
+      leftByIds,
+      declinedByIds,
+    }
+    const remainingActiveIds = this.getActiveJoinedParticipantIds(nextCall)
+
+    if (remainingActiveIds.length > 1) {
+      const updated = await CallRepository.update(call.callId, { leftByIds, declinedByIds })
+      return { call: this.toPublicCall(updated, normalizedUserId), partial: true }
+    }
+
+    const terminalAt = Date.now()
+    const updated = await CallRepository.update(call.callId, {
+      status: 'ended',
+      endedBy: normalizedUserId,
+      endedAt: terminalAt,
+      durationSeconds: this.calculateDurationSeconds(call, terminalAt),
+      leftByIds,
+      declinedByIds,
+    })
+    await this.finalizeTerminalCall(call, updated)
+
+    return { call: this.toPublicCall(updated, normalizedUserId) }
+  }
+
+  async finalizeTerminalCall(previousCall, updatedCall) {
+    this.clearCallTimers(updatedCall.callId)
+    await this.completeGroupCallActiveNotice(updatedCall, Number(updatedCall.endedAt || updatedCall.missedAt || Date.now()))
+    await this.persistCallMessage(updatedCall)
+    await this.deleteMeetingQuietly(previousCall.meetingId)
+  }
+
+  async handleConversationParticipantAdded(payload = {}) {
+    const conversationId = this.normalizeId(payload.conversationId)
+    const participantId = this.normalizeId(payload.participantId)
+    if (!conversationId || !participantId) return
+
+    const call = await CallRepository.findActiveByConversation(conversationId)
+    if (!call || call.status !== 'accepted' || !this.isGroupCall(call)) return
+
+    const participantIds = this.uniqueIds([...this.getCallParticipantIds(call), participantId])
+    const updated = await CallRepository.update(call.callId, { participantIds })
+    this.emitToUser('call:active_available', participantId, updated)
+  }
+
+  async handleConversationParticipantRemoved(payload = {}) {
+    const conversationId = this.normalizeId(payload.conversationId)
+    const participantId = this.normalizeId(payload.participantId)
+    if (!conversationId || !participantId) return
+
+    const call = await CallRepository.findActiveByConversation(conversationId)
+    if (!call || !this.getCallParticipantIds(call).includes(participantId)) return
+
+    if (call.status === 'accepted' && this.isGroupCall(call)) {
+      const result = await this.leaveAcceptedGroupCall(call, participantId, 'removed')
+      if (result.partial) {
+        this.emitToCallParticipants('call:participant_left', result.call, {
+          participantId,
+          reason: 'removed',
+        })
+        return
+      }
+
+      this.emitToCallParticipants('call:ended', result.call, { endedBy: participantId })
+      return
+    }
+
+    if (call.status === 'ringing') {
+      const callerId = this.normalizeId(call.callerId)
+      if (participantId === callerId) {
+        const updated = await CallRepository.update(call.callId, {
+          status: 'missed',
+          endedBy: participantId,
+          missedAt: Date.now(),
+          durationSeconds: 0,
+        })
+        await this.finalizeTerminalCall(call, updated)
+        this.emitToCallParticipants('call:missed', updated, { endedBy: participantId })
+        return
+      }
+
+      const declinedByIds = this.uniqueIds([...(call.declinedByIds || []), participantId])
+      const recipientIds = this.getCallParticipantIds(call).filter((id) => id !== callerId)
+      const everyRecipientDeclined = recipientIds.every((id) => declinedByIds.includes(id))
+
+      if (!everyRecipientDeclined) {
+        const updated = await CallRepository.update(call.callId, { declinedByIds })
+        this.emitToCallParticipants('call:participant_left', updated, {
+          participantId,
+          reason: 'removed',
+        })
+        return
+      }
+
+      const updated = await CallRepository.update(call.callId, {
+        status: 'missed',
+        declinedBy: participantId,
+        declinedAt: Date.now(),
+        missedAt: Date.now(),
+        durationSeconds: 0,
+        declinedByIds,
+      })
+      await this.finalizeTerminalCall(call, updated)
+      this.emitToCallParticipants('call:missed', updated, { declinedBy: participantId })
+    }
   }
 
   async deleteMeetingQuietly(meetingId) {

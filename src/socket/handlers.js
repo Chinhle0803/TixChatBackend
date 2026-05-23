@@ -272,8 +272,10 @@ export const initializeSocketHandlers = (io) => {
   messageEvents.on(MESSAGE_EVENTS.EDITED, (data) => {
     io.to(`conversation:${data.conversationId}`).emit('message:edited', {
       messageId: data.messageId,
-      content: data.newContent,
-      isEdited: true,
+      message: data.message,
+      content: data.message?.content ?? data.newContent,
+      isEdited: data.message?.isEdited ?? true,
+      metadata: data.message?.metadata,
     })
   })
 

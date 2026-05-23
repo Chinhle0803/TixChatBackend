@@ -33,11 +33,26 @@ class CallController {
   async acceptCall(req, res) {
     try {
       const result = await callService.acceptCall(req.params.callId, req.userId)
-      this.emit('call:accepted', result.call, { acceptedBy: req.userId })
+      if (!result.joinedExisting) {
+        this.emit('call:accepted', result.call, { acceptedBy: req.userId })
+      }
       this.emit('call:participant_joined', result.call, { participantId: req.userId })
       return res.json(result)
     } catch (error) {
       return res.status(400).json({ error: error.message || 'Failed to accept call' })
+    }
+  }
+
+  async joinCall(req, res) {
+    try {
+      const result = await callService.joinCall(req.params.callId, req.userId)
+      if (result.acceptedFromRinging) {
+        this.emit('call:accepted', result.call, { acceptedBy: req.userId })
+      }
+      this.emit('call:participant_joined', result.call, { participantId: req.userId })
+      return res.json(result)
+    } catch (error) {
+      return res.status(400).json({ error: error.message || 'Failed to join call' })
     }
   }
 
@@ -80,6 +95,9 @@ class CallController {
   async getAttendee(req, res) {
     try {
       const result = await callService.getOrCreateAttendee(req.params.callId, req.userId)
+      if (result.call?.status === 'accepted') {
+        this.emit('call:participant_joined', result.call, { participantId: req.userId })
+      }
       return res.json(result)
     } catch (error) {
       return res.status(400).json({ error: error.message || 'Failed to join call' })
@@ -92,6 +110,27 @@ class CallController {
       return res.json(result)
     } catch (error) {
       return res.status(400).json({ error: error.message || 'Failed to get call' })
+    }
+  }
+
+  async getCurrentCall(req, res) {
+    try {
+      const result = await callService.getCurrentCallForUser(req.userId)
+      return res.json(result)
+    } catch (error) {
+      return res.status(400).json({ error: error.message || 'Failed to get current call' })
+    }
+  }
+
+  async getActiveConversationCall(req, res) {
+    try {
+      const result = await callService.getActiveCallForConversation(
+        req.params.conversationId,
+        req.userId
+      )
+      return res.json(result)
+    } catch (error) {
+      return res.status(400).json({ error: error.message || 'Failed to get active conversation call' })
     }
   }
 }
