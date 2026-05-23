@@ -21,7 +21,14 @@ const defaultFrontendOrigins = [
   'http://127.0.0.1:19006',
 ]
 
-const frontendOrigins = parseOrigins(process.env.FRONTEND_URLS, defaultFrontendOrigins)
+const configuredFrontendOrigins = [
+  ...parseOrigins(process.env.FRONTEND_URLS, []),
+  ...parseOrigins(process.env.FRONTEND_URL, []),
+]
+
+const frontendOrigins = configuredFrontendOrigins.length
+  ? Array.from(new Set(configuredFrontendOrigins))
+  : defaultFrontendOrigins
 
 export const config = {
   // Server
@@ -42,7 +49,7 @@ export const config = {
   jwtRefreshExpire: process.env.JWT_REFRESH_EXPIRE || '30d',
 
   // Frontend
-  frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
+  frontendUrl: process.env.FRONTEND_URL || frontendOrigins[0] || 'http://localhost:5173',
   frontendOrigins,
 
   // Redis

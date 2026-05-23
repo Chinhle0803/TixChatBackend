@@ -24,7 +24,7 @@ const app = express()
 
 const isAllowedOrigin = (origin) => {
   if (!origin) return true
-  return true
+  return config.frontendOrigins.includes(origin)
 }
 
 const corsOriginHandler = (origin, callback) => {
