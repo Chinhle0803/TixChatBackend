@@ -19,6 +19,7 @@ import notificationRoutes from './routes/notification.js'
 import postRoutes from './routes/post.js'
 import mapRoutes from './routes/map.js'
 import assistantRoutes from './routes/assistant.js'
+import mediaRoutes from './routes/media.js'
 
 const app = express()
 
@@ -75,6 +76,7 @@ app.use('/api/notifications', notificationRoutes)
 app.use('/api/posts', postRoutes)
 app.use('/api/maps', mapRoutes)
 app.use('/api/assistant', assistantRoutes)
+app.use('/api/media', mediaRoutes)
 
 // Socket.IO
 initializeSocketHandlers(io)

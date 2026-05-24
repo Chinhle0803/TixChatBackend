@@ -72,6 +72,20 @@ const normalizeImages = (images) => {
     .slice(0, 6)
 }
 
+const isAbsoluteImageUrl = (value) => /^(?:https?:)?\/\//i.test(String(value || '').trim())
+const isDataImageUrl = (value) => /^data:image\//i.test(String(value || '').trim())
+
+const buildPostImageUrlFromKey = (value) => {
+  const key = String(value || '').trim().replace(/^\/+/, '')
+  if (!key) return ''
+  return `https://${config.s3PostImagesBucket}.s3.${config.awsS3Region}.amazonaws.com/${key}`
+}
+
+const normalizeImagesForRead = (images) => normalizeImages(images).map((image) => {
+  if (isAbsoluteImageUrl(image) || isDataImageUrl(image)) return image
+  return buildPostImageUrlFromKey(image)
+})
+
 const normalizeLocation = (location = {}) => {
   if (!location || typeof location !== 'object') return null
   const lat = Number(location.lat)
@@ -91,6 +105,8 @@ const normalizeLocation = (location = {}) => {
 const isSameLocation = (a = null, b = null) =>
   JSON.stringify(a || null) === JSON.stringify(b || null)
 
+const isSameImageList = (a = [], b = []) => JSON.stringify(a || []) === JSON.stringify(b || [])
+
 class PostService {
   async normalizePostForRead(post = null) {
     if (!post || typeof post !== 'object') return post
@@ -99,34 +115,52 @@ class PostService {
     const nextLocation = normalizedLocation
       ? await locationResolutionService.enrichLocation(normalizedLocation)
       : null
+    const nextImages = normalizeImagesForRead(post.images)
+    const nextPost = {
+      ...post,
+      images: nextImages,
+      location: nextLocation || post.location,
+    }
 
     if (!nextLocation) {
-      return post
+      if (!isSameImageList(post.images, nextImages)) {
+        await redisCache.setJson(
+          getPostCacheKey(post.postId),
+          nextPost,
+          config.redisPostTtlSeconds
+        )
+      }
+      return nextPost
     }
 
     if (isSameLocation(post.location, nextLocation)) {
-      return {
-        ...post,
-        location: nextLocation,
+      if (!isSameImageList(post.images, nextImages)) {
+        await redisCache.setJson(
+          getPostCacheKey(post.postId),
+          nextPost,
+          config.redisPostTtlSeconds
+        )
       }
+      return nextPost
     }
 
     try {
       const updated = await postRepository.updateLocation(post.postId, nextLocation)
       const safeUpdated = updated || { ...post, location: nextLocation }
+      const normalizedUpdated = {
+        ...safeUpdated,
+        images: nextImages,
+      }
 
       await redisCache.setJson(
         getPostCacheKey(post.postId),
-        safeUpdated,
+        normalizedUpdated,
         config.redisPostTtlSeconds
       )
 
-      return safeUpdated
+      return normalizedUpdated
     } catch {
-      return {
-        ...post,
-        location: nextLocation,
-      }
+      return nextPost
     }
   }
 
