@@ -11,7 +11,7 @@ import {
   TYPING_EVENTS,
 } from '../events/EventTypes.js'
 
-// Store active socket connections (userId -> socket.id)
+// Store active socket connections (userId -> Set<socket.id>)
 const userSockets = new Map()
 
 const normalizeParticipantId = (participant) => {
@@ -20,6 +20,33 @@ const normalizeParticipantId = (participant) => {
     return String(participant._id || participant.userId || participant.id || '')
   }
   return String(participant)
+}
+
+const addUserSocket = (userId, socketId) => {
+  const key = String(userId || '')
+  if (!key || !socketId) return 0
+
+  const sockets = userSockets.get(key) || new Set()
+  sockets.add(socketId)
+  userSockets.set(key, sockets)
+  return sockets.size
+}
+
+const removeUserSocket = (userId, socketId) => {
+  const key = String(userId || '')
+  if (!key) return 0
+
+  const sockets = userSockets.get(key)
+  if (!sockets) return 0
+
+  sockets.delete(socketId)
+  if (sockets.size === 0) {
+    userSockets.delete(key)
+    return 0
+  }
+
+  userSockets.set(key, sockets)
+  return sockets.size
 }
 
 export const initializeSocketHandlers = (io) => {
@@ -45,13 +72,19 @@ export const initializeSocketHandlers = (io) => {
     socket.join(`user:${socket.userId}`)
 
     // Store socket connection
-    userSockets.set(socket.userId, socket.id)
+    const activeSocketCount = addUserSocket(socket.userId, socket.id)
 
-    // Set user online
-    await userService.setOnlineStatus(socket.userId, true)
+    if (activeSocketCount === 1) {
+      // Set user online only when the first active socket connects.
+      const onlineUser = await userService.setOnlineStatus(socket.userId, true)
 
-    // Broadcast user online
-    io.emit('user:online', { userId: socket.userId })
+      // Broadcast user online
+      io.emit('user:online', {
+        userId: socket.userId,
+        isOnline: true,
+        lastSeen: onlineUser?.lastSeen || null,
+      })
+    }
 
     // ==================== MESSAGE EVENTS ====================
     socket.on('send_message', async (data, callback) => {
@@ -212,13 +245,19 @@ export const initializeSocketHandlers = (io) => {
       console.log(`❌ User disconnected: ${socket.userId}`)
 
       // Remove socket connection
-      userSockets.delete(socket.userId)
+      const remainingSocketCount = removeUserSocket(socket.userId, socket.id)
+
+      if (remainingSocketCount > 0) return
 
       // Set user offline
-      await userService.setOnlineStatus(socket.userId, false)
+      const offlineUser = await userService.setOnlineStatus(socket.userId, false)
 
       // Broadcast user offline
-      io.emit('user:offline', { userId: socket.userId })
+      io.emit('user:offline', {
+        userId: socket.userId,
+        isOnline: false,
+        lastSeen: offlineUser?.lastSeen || Date.now(),
+      })
     })
   })
 

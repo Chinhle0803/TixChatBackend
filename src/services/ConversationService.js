@@ -330,6 +330,8 @@ export class ConversationService {
         name: profile?.fullName || profile?.displayName || profile?.username || null,
         avatar: profile?.avatar || null,
         isOnline: profile?.isOnline || false,
+        lastSeen: profile?.lastSeen || null,
+        lastSeenAt: profile?.lastSeenAt || profile?.lastSeen || null,
         role: item.role || 'member',
         joinedAt: item.joinedAt,
       }
@@ -670,6 +672,8 @@ export class ConversationService {
           name: profile?.fullName || profile?.displayName || profile?.username || null,
           avatar: profile?.avatar || null,
           isOnline: profile?.isOnline || false,
+          lastSeen: profile?.lastSeen || null,
+          lastSeenAt: profile?.lastSeenAt || profile?.lastSeen || null,
         }
       }
 
@@ -746,6 +750,8 @@ export class ConversationService {
         name: profile?.fullName || profile?.displayName || profile?.username || null,
         avatar: profile?.avatar || null,
         isOnline: profile?.isOnline || false,
+        lastSeen: profile?.lastSeen || null,
+        lastSeenAt: profile?.lastSeenAt || profile?.lastSeen || null,
       }
     }
 

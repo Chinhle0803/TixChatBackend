@@ -138,10 +138,7 @@ export class UserService {
   }
 
   async setOnlineStatus(userId, isOnline) {
-    const user = await UserRepository.update(userId, {
-      isOnline,
-      lastSeen: Date.now(),
-    })
+    const user = await UserRepository.updateOnlineStatus(userId, isOnline)
     const publicUser = toPublicUser(user)
     await invalidateUserReadCaches(userId)
 
