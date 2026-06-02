@@ -27,7 +27,7 @@ class ContextAssembler {
       ...(Array.isArray(outputs?.nearbyTool?.incidents) ? outputs.nearbyTool.incidents : []),
     ]
 
-    const incidents = sortIncidents(dedupeIncidents(incidentLists)).slice(0, config.aiMaxContextPosts)
+    const incidents = sortIncidents(dedupeIncidents(incidentLists), parsedQuery).slice(0, config.aiMaxContextPosts)
     const relatedPosts = incidents.slice(0, 3).map((incident) => ({
       postId: incident.postId,
       title: incident.content,

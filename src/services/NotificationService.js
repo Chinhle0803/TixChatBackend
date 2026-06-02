@@ -139,7 +139,7 @@ class NotificationService {
 
   handleExpoDeliveryError(errorCode, token) {
     if (errorCode === 'DeviceNotRegistered' && token) {
-      NotificationTokenRepository.disable(token).catch(() => {})
+      NotificationTokenRepository.disable(token).catch(() => { })
     }
   }
 
