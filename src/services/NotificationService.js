@@ -3,7 +3,10 @@ import UserRepository from '../repositories/UserRepository.js'
 import config from '../config/index.js'
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send'
+const EXPO_PUSH_RECEIPTS_URL = 'https://exp.host/--/api/v2/push/getReceipts'
 const MAX_EXPO_MESSAGES_PER_REQUEST = 100
+const MAX_EXPO_RECEIPTS_PER_REQUEST = 1000
+const PUSH_RECEIPT_CHECK_DELAY_MS = 15000
 const MESSAGE_NOTIFICATION_CHANNEL_ID = 'messages'
 const CALL_NOTIFICATION_CHANNEL_ID = 'calls'
 const SERVER_NOTIFICATION_SOURCE = 'server'
@@ -134,6 +137,57 @@ class NotificationService {
     }
   }
 
+  handleExpoDeliveryError(errorCode, token) {
+    if (errorCode === 'DeviceNotRegistered' && token) {
+      NotificationTokenRepository.disable(token).catch(() => {})
+    }
+  }
+
+  schedulePushReceiptCheck(receiptTokenPairs = []) {
+    if (!Array.isArray(receiptTokenPairs) || receiptTokenPairs.length === 0) return
+
+    const receiptTimer = setTimeout(() => {
+      this.checkExpoPushReceipts(receiptTokenPairs).catch((error) => {
+        console.warn('Failed to check Expo push receipts:', error?.message || error)
+      })
+    }, PUSH_RECEIPT_CHECK_DELAY_MS)
+    receiptTimer.unref?.()
+  }
+
+  async checkExpoPushReceipts(receiptTokenPairs = []) {
+    for (let index = 0; index < receiptTokenPairs.length; index += MAX_EXPO_RECEIPTS_PER_REQUEST) {
+      const chunk = receiptTokenPairs.slice(index, index + MAX_EXPO_RECEIPTS_PER_REQUEST)
+      const ids = chunk.map((item) => item.id).filter(Boolean)
+      if (ids.length === 0) continue
+
+      const response = await fetch(EXPO_PUSH_RECEIPTS_URL, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Accept-Encoding': 'gzip, deflate',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ids }),
+      })
+
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) {
+        const summary = summarizeExpoPushError(payload)
+        console.warn('Expo push receipt request failed:', response.status, summary || response.statusText)
+        continue
+      }
+
+      const receipts = payload?.data || {}
+      chunk.forEach((item) => {
+        const receipt = receipts?.[item.id]
+        if (!receipt || receipt.status !== 'error') return
+        const errorCode = receipt?.details?.error
+        console.warn('Expo push receipt error:', errorCode || receipt?.message || receipt)
+        this.handleExpoDeliveryError(errorCode, item.token)
+      })
+    }
+  }
+
   async sendExpoPushMessages(messages = []) {
     for (let index = 0; index < messages.length; index += MAX_EXPO_MESSAGES_PER_REQUEST) {
       const chunk = messages.slice(index, index + MAX_EXPO_MESSAGES_PER_REQUEST)
@@ -161,16 +215,21 @@ class NotificationService {
           console.warn('Expo push response errors:', summarizeExpoPushError(payload))
         }
 
+        const receiptTokenPairs = []
         const tickets = Array.isArray(payload?.data) ? payload.data : []
         tickets.forEach((ticket, ticketIndex) => {
-          if (ticket?.status !== 'error') return
           const token = chunk[ticketIndex]?.to
+          if (ticket?.status === 'ok' && ticket?.id) {
+            receiptTokenPairs.push({ id: ticket.id, token })
+            return
+          }
+
+          if (ticket?.status !== 'error') return
           const errorCode = ticket?.details?.error
           console.warn('Expo push error:', errorCode || ticket?.message || ticket)
-          if (errorCode === 'DeviceNotRegistered' && token) {
-            NotificationTokenRepository.disable(token).catch(() => {})
-          }
+          this.handleExpoDeliveryError(errorCode, token)
         })
+        this.schedulePushReceiptCheck(receiptTokenPairs)
       } catch (error) {
         console.warn('Failed to send Expo push notifications:', error?.message || error)
       }
