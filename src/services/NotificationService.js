@@ -1,8 +1,13 @@
 import NotificationTokenRepository from '../repositories/NotificationTokenRepository.js'
 import UserRepository from '../repositories/UserRepository.js'
+import config from '../config/index.js'
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send'
 const MAX_EXPO_MESSAGES_PER_REQUEST = 100
+const MESSAGE_NOTIFICATION_CHANNEL_ID = 'messages'
+const CALL_NOTIFICATION_CHANNEL_ID = 'calls'
+const SERVER_NOTIFICATION_SOURCE = 'server'
+const EXPO_PUSH_TOKEN_PATTERN = /^(ExponentPushToken|ExpoPushToken)\[[^\]]+\]$/
 
 const normalizeId = (value) => {
   if (!value) return ''
@@ -14,6 +19,28 @@ const truncate = (value = '', maxLength = 110) => {
   const text = String(value || '').replace(/\s+/g, ' ').trim()
   if (text.length <= maxLength) return text
   return `${text.slice(0, maxLength - 1).trim()}…`
+}
+
+const isExpoPushToken = (token) => EXPO_PUSH_TOKEN_PATTERN.test(String(token || '').trim())
+
+const getExpoTokens = (tokens = []) =>
+  (tokens || []).filter((item) => isExpoPushToken(item?.token))
+
+const normalizeCallType = (callType) =>
+  String(callType || '').toLowerCase() === 'video' ? 'video' : 'audio'
+
+const getCallTypeLabel = (callType) =>
+  normalizeCallType(callType) === 'video' ? 'video' : 'thoại'
+
+const summarizeExpoPushError = (payload) => {
+  if (!payload) return ''
+  if (Array.isArray(payload?.errors)) {
+    return payload.errors
+      .map((error) => error?.message || error?.code || String(error || ''))
+      .filter(Boolean)
+      .join('; ')
+  }
+  return payload?.message || ''
 }
 
 class NotificationService {
@@ -101,6 +128,8 @@ class NotificationService {
         type: 'message',
         conversationId: normalizeId(message?.conversationId),
         messageId: normalizeId(message?.messageId || message?._id),
+        senderId,
+        notificationSource: SERVER_NOTIFICATION_SOURCE,
       },
     }
   }
@@ -122,6 +151,16 @@ class NotificationService {
         })
 
         const payload = await response.json().catch(() => null)
+        if (!response.ok) {
+          const summary = summarizeExpoPushError(payload)
+          console.warn('Expo push request failed:', response.status, summary || response.statusText)
+          continue
+        }
+
+        if (Array.isArray(payload?.errors) && payload.errors.length > 0) {
+          console.warn('Expo push response errors:', summarizeExpoPushError(payload))
+        }
+
         const tickets = Array.isArray(payload?.data) ? payload.data : []
         tickets.forEach((ticket, ticketIndex) => {
           if (ticket?.status !== 'error') return
@@ -146,10 +185,7 @@ class NotificationService {
     if (recipients.length === 0) return
 
     const tokens = await NotificationTokenRepository.findEnabledByUserIds(recipients)
-    const expoTokens = tokens.filter((item) => {
-      const token = String(item?.token || '')
-      return token.startsWith('ExponentPushToken') || token.startsWith('ExpoPushToken')
-    })
+    const expoTokens = getExpoTokens(tokens)
     if (expoTokens.length === 0) return
 
     const notification = await this.buildNotificationPayload({ conversation, message })
@@ -159,6 +195,8 @@ class NotificationService {
       title: notification.title,
       body: notification.body,
       data: notification.data,
+      channelId: MESSAGE_NOTIFICATION_CHANNEL_ID,
+      priority: 'high',
     }))
 
     await this.sendExpoPushMessages(messages)
@@ -175,26 +213,29 @@ class NotificationService {
     if (!callerId || recipients.length === 0) return
 
     const tokens = await NotificationTokenRepository.findEnabledByUserIds(recipients)
-    const expoTokens = tokens.filter((item) => {
-      const token = String(item?.token || '')
-      return token.startsWith('ExponentPushToken') || token.startsWith('ExpoPushToken')
-    })
+    const expoTokens = getExpoTokens(tokens)
     if (expoTokens.length === 0) return
 
     const caller = await UserRepository.findById(callerId).catch(() => null)
     const callerName = this.getDisplayName(caller)
-    const callType = String(call?.callType || '').toLowerCase() === 'video' ? 'video' : 'thoại'
+    const callType = normalizeCallType(call?.callType)
+    const callTypeLabel = getCallTypeLabel(callType)
+    const ttl = Math.max(1, Number(config.callRingTimeoutSeconds || 60))
     const messages = expoTokens.map((item) => ({
       to: item.token,
       sound: 'default',
       title: callerName || 'Cuộc gọi đến',
-      body: `Cuộc gọi ${callType} đến`,
+      body: `Cuộc gọi ${callTypeLabel} đến`,
       data: {
         type: 'call',
         callId: normalizeId(call?.callId),
         conversationId: normalizeId(call?.conversationId),
         callType,
+        notificationSource: SERVER_NOTIFICATION_SOURCE,
       },
+      channelId: CALL_NOTIFICATION_CHANNEL_ID,
+      priority: 'high',
+      ttl,
     }))
 
     await this.sendExpoPushMessages(messages)
