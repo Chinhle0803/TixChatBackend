@@ -25,7 +25,20 @@ const app = express()
 
 const isAllowedOrigin = (origin) => {
   if (!origin) return true
-  return config.frontendOrigins.includes(origin)
+  
+  // Allow configured frontend origins
+  if (config.frontendOrigins.includes(origin)) return true
+
+  // Allow localhost & 127.0.0.1 with any port
+  if (/^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(origin)) return true
+
+  // Allow ngrok URLs
+  if (/(?:\.ngrok-free\.dev|\.ngrok\.app|\.ngrok\.io)$/i.test(origin)) return true
+
+  // Allow file:// origin (often used by mobile clients/webviews)
+  if (origin === 'file://') return true
+
+  return false
 }
 
 const corsOriginHandler = (origin, callback) => {
