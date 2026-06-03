@@ -66,6 +66,7 @@ await jest.unstable_mockModule('../../config/index.js', () => ({
     awsSecretAccessKey: 'test',
     chimeMeetingRegion: 'ap-southeast-1',
     callRingTimeoutSeconds: 60,
+    callDisconnectGraceSeconds: 60,
   },
 }))
 
@@ -95,6 +96,14 @@ await jest.unstable_mockModule('../../repositories/CallRepository.js', () => ({
           ['ringing', 'accepted'].includes(call.status)
         )
         .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))[0] || null
+    ),
+    findActiveByUser: jest.fn(async (userId) =>
+      Array.from(calls.values())
+        .filter((call) =>
+          getCallParticipantIds(call).includes(userId) &&
+          ['ringing', 'accepted'].includes(call.status)
+        )
+        .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
     ),
   },
 }))
@@ -227,6 +236,41 @@ describe('CallService direct calls', () => {
       conversationId: 'direct-2',
     }))
     expect(chimeSend).toHaveBeenCalledWith(expect.any(DeleteMeetingCommand))
+  })
+
+  test('ends an accepted direct call after participant disconnect grace expires', async () => {
+    createConversation('direct-3', '1-1', ['user-a', 'user-b'])
+    const service = createService()
+    const started = await service.startCall('direct-3', 'user-a', 'audio')
+    await service.acceptCall(started.call.callId, 'user-b')
+
+    service.scheduleParticipantDisconnectTimeout('user-b')
+    await jest.advanceTimersByTimeAsync(60000)
+
+    expect(calls.get(started.call.callId).status).toBe('ended')
+    expect(ioEmit).toHaveBeenCalledWith('call:participant_connection_lost', expect.objectContaining({
+      participantId: 'user-b',
+    }))
+    expect(ioEmit).toHaveBeenCalledWith('call:ended', expect.objectContaining({
+      disconnectedBy: 'user-b',
+      reason: 'disconnected',
+    }))
+  })
+
+  test('keeps an accepted direct call alive when participant reconnects before grace expires', async () => {
+    createConversation('direct-4', '1-1', ['user-a', 'user-b'])
+    const service = createService()
+    const started = await service.startCall('direct-4', 'user-a', 'audio')
+    await service.acceptCall(started.call.callId, 'user-b')
+
+    service.scheduleParticipantDisconnectTimeout('user-b')
+    expect(service.cancelParticipantDisconnectTimeout('user-b')).toBe(true)
+    await jest.advanceTimersByTimeAsync(60000)
+
+    expect(calls.get(started.call.callId).status).toBe('accepted')
+    expect(ioEmit).toHaveBeenCalledWith('call:participant_connection_restored', expect.objectContaining({
+      participantId: 'user-b',
+    }))
   })
 })
 

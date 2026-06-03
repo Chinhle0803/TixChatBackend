@@ -3,6 +3,7 @@ import userService from '../services/UserService.js'
 import messageService from '../services/MessageService.js'
 import conversationService from '../services/ConversationService.js'
 import notificationService from '../services/NotificationService.js'
+import callService from '../services/CallService.js'
 import { messageEvents, conversationEvents, userEvents } from '../events/EventBus.js'
 import {
   USER_EVENTS,
@@ -73,6 +74,7 @@ export const initializeSocketHandlers = (io) => {
 
     // Store socket connection
     const activeSocketCount = addUserSocket(socket.userId, socket.id)
+    callService.cancelParticipantDisconnectTimeout(socket.userId)
 
     if (activeSocketCount === 1) {
       // Set user online only when the first active socket connects.
@@ -248,6 +250,8 @@ export const initializeSocketHandlers = (io) => {
       const remainingSocketCount = removeUserSocket(socket.userId, socket.id)
 
       if (remainingSocketCount > 0) return
+
+      callService.scheduleParticipantDisconnectTimeout(socket.userId)
 
       // Set user offline
       const offlineUser = await userService.setOnlineStatus(socket.userId, false)

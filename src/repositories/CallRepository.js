@@ -147,6 +147,33 @@ class CallRepository {
       throw new Error(`Failed to find active call by user: ${error.message}`)
     }
   }
+
+  async findActiveByUser(userId) {
+    const normalizedUserId = String(userId || '').trim()
+    if (!normalizedUserId) return []
+
+    try {
+      const result = await docClient.send(new ScanCommand({
+        TableName: TABLE_NAME,
+        FilterExpression: 'contains(participantIds, :userId) AND #status IN (:ringing, :accepted)',
+        ExpressionAttributeNames: {
+          '#status': 'status',
+        },
+        ExpressionAttributeValues: {
+          ':userId': normalizedUserId,
+          ':ringing': 'ringing',
+          ':accepted': 'accepted',
+        },
+      }))
+
+      const items = Array.isArray(result.Items) ? result.Items : []
+      return items.sort((left, right) =>
+        Number(right?.updatedAt || right?.createdAt || 0) - Number(left?.updatedAt || left?.createdAt || 0)
+      )
+    } catch (error) {
+      throw new Error(`Failed to find active calls by user: ${error.message}`)
+    }
+  }
 }
 
 export default new CallRepository()

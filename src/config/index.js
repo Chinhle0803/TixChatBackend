@@ -115,6 +115,7 @@ export const config = {
   awsChimeRegion: process.env.AWS_CHIME_REGION || process.env.AWS_REGION || 'us-east-1',
   chimeMeetingRegion: process.env.CHIME_MEETING_REGION || process.env.AWS_CHIME_REGION || process.env.AWS_REGION || 'us-east-1',
   callRingTimeoutSeconds: parseInt(process.env.CALL_RING_TIMEOUT_SECONDS || '60', 10),
+  callDisconnectGraceSeconds: parseInt(process.env.CALL_DISCONNECT_GRACE_SECONDS || '60', 10),
 }
 
 export default config

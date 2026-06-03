@@ -30,6 +30,7 @@ export class CallService {
     })
     this.missedCallTimers = new Map()
     this.ringingEventTimers = new Map()
+    this.participantDisconnectTimers = new Map()
     this.boundConversationEvents = false
     this.bindConversationEvents()
   }
@@ -519,6 +520,138 @@ export class CallService {
   clearCallTimers(callId) {
     this.clearMissedTimeout(callId)
     this.clearRingingEvents(callId)
+  }
+
+  getDisconnectGraceMs() {
+    return Math.max(5, Number(config.callDisconnectGraceSeconds || 60)) * 1000
+  }
+
+  getParticipantDisconnectTimerKey(userId) {
+    return this.normalizeId(userId)
+  }
+
+  cancelParticipantDisconnectTimeout(userId) {
+    const key = this.getParticipantDisconnectTimerKey(userId)
+    if (!key) return false
+
+    const timer = this.participantDisconnectTimers.get(key)
+    if (!timer) return false
+
+    clearTimeout(timer)
+    this.participantDisconnectTimers.delete(key)
+    this.emitParticipantConnectionRestored(key).catch((error) => {
+      console.warn('Failed to emit participant connection restored:', error?.message || error)
+    })
+    return true
+  }
+
+  scheduleParticipantDisconnectTimeout(userId) {
+    const key = this.getParticipantDisconnectTimerKey(userId)
+    if (!key) return
+
+    const existingTimer = this.participantDisconnectTimers.get(key)
+    if (existingTimer) clearTimeout(existingTimer)
+    this.participantDisconnectTimers.delete(key)
+    this.emitParticipantConnectionLost(key).catch((error) => {
+      console.warn('Failed to emit participant connection lost:', error?.message || error)
+    })
+
+    const timer = setTimeout(async () => {
+      try {
+        await this.handleParticipantDisconnectTimeout(key)
+      } catch (error) {
+        console.warn('Failed to end disconnected participant call:', error?.message || error)
+      } finally {
+        this.participantDisconnectTimers.delete(key)
+      }
+    }, this.getDisconnectGraceMs())
+
+    this.participantDisconnectTimers.set(key, timer)
+  }
+
+  async getActiveCallsForUser(userId) {
+    if (typeof CallRepository.findActiveByUser === 'function') {
+      return CallRepository.findActiveByUser(userId)
+    }
+
+    const call = await CallRepository.findLatestActiveByUser(userId)
+    return call ? [call] : []
+  }
+
+  isDisconnectRelevantForCall(call, userId) {
+    const normalizedUserId = this.normalizeId(userId)
+    if (!call || !normalizedUserId) return false
+    if (!ACTIVE_STATUSES.includes(call.status)) return false
+    if (!this.getCallParticipantIds(call).includes(normalizedUserId)) return false
+
+    if (call.status === 'accepted' && this.isGroupCall(call)) {
+      return this.getActiveJoinedParticipantIds(call).includes(normalizedUserId)
+    }
+
+    return true
+  }
+
+  async emitParticipantConnectionLost(userId) {
+    const activeCalls = await this.getActiveCallsForUser(userId)
+    activeCalls
+      .filter((call) => this.isDisconnectRelevantForCall(call, userId))
+      .forEach((call) => {
+        this.emitToCallParticipants('call:participant_connection_lost', call, {
+          participantId: this.normalizeId(userId),
+        })
+      })
+  }
+
+  async emitParticipantConnectionRestored(userId) {
+    const activeCalls = await this.getActiveCallsForUser(userId)
+    activeCalls
+      .filter((call) => this.isDisconnectRelevantForCall(call, userId))
+      .forEach((call) => {
+        this.emitToCallParticipants('call:participant_connection_restored', call, {
+          participantId: this.normalizeId(userId),
+        })
+      })
+  }
+
+  emitDisconnectedParticipantResult(result, userId, fallbackEventName = 'call:ended') {
+    if (!result?.call?.callId) return
+
+    const participantId = this.normalizeId(userId)
+    if (result.partial) {
+      this.emitToCallParticipants('call:participant_left', result.call, {
+        participantId,
+        reason: 'disconnected',
+      })
+      return
+    }
+
+    const eventName = result.call.status === 'missed' ? 'call:missed' : fallbackEventName
+    this.emitToCallParticipants(eventName, result.call, {
+      endedBy: participantId,
+      disconnectedBy: participantId,
+      reason: 'disconnected',
+    })
+  }
+
+  async handleParticipantDisconnectTimeout(userId) {
+    const normalizedUserId = this.normalizeId(userId)
+    if (!normalizedUserId) return
+
+    const activeCalls = await this.getActiveCallsForUser(normalizedUserId)
+    for (const activeCall of activeCalls) {
+      const call = await CallRepository.findById(activeCall.callId)
+      if (!this.isDisconnectRelevantForCall(call, normalizedUserId)) continue
+
+      const isRingingRecipient =
+        call.status === 'ringing' &&
+        this.normalizeId(call.callerId) !== normalizedUserId
+
+      const result = isRingingRecipient
+        ? await this.declineCall(call.callId, normalizedUserId)
+        : await this.endCall(call.callId, normalizedUserId)
+
+      this.emitDisconnectedParticipantResult(result, normalizedUserId)
+    }
   }
 
   getIncomingCallRecipientIds(call) {
